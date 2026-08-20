@@ -611,6 +611,399 @@ async def test_get_activity_exercise_sets_tool(app_with_activity_management, moc
     mock_garmin_client.get_activity_exercise_sets.assert_called_once_with(activity_id)
 
 
+def _strength_sets_payload(activity_id=12345678901):
+    return {
+        "activityId": activity_id,
+        "exerciseSets": [
+            {
+                "exercises": [{"category": "UNKNOWN", "name": None, "probability": 99.0}],
+                "duration": 30.0,
+                "repetitionCount": 10,
+                "weight": None,
+                "setType": "ACTIVE",
+                "startTime": "2026-08-13T10:00:00.0",
+                "wktStepIndex": None,
+                "messageIndex": 0,
+            },
+            {
+                "exercises": [],
+                "duration": 60.0,
+                "repetitionCount": None,
+                "weight": None,
+                "setType": "REST",
+                "startTime": "2026-08-13T10:00:30.0",
+                "wktStepIndex": None,
+                "messageIndex": 1,
+            },
+            {
+                "exercises": [{"category": "UNKNOWN", "name": None, "probability": 99.0}],
+                "duration": 28.0,
+                "repetitionCount": 10,
+                "weight": None,
+                "setType": "ACTIVE",
+                "startTime": "2026-08-13T10:01:30.0",
+                "wktStepIndex": None,
+                "messageIndex": 2,
+            },
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_update_strength_activity_sets_previews_without_writing(
+    app_with_activity_management, mock_garmin_client
+):
+    activity_id = 12345678901
+    mock_garmin_client.get_activity.return_value = {
+        "activityTypeDTO": {"typeKey": "strength_training"}
+    }
+    mock_garmin_client.get_activity_exercise_sets.return_value = _strength_sets_payload()
+
+    result = await app_with_activity_management.call_tool(
+        "update_strength_activity_sets",
+        {
+            "activity_id": activity_id,
+            "updates": [{
+                "set_index": 1,
+                "category": "bench_press",
+                "exercise_name": "barbell_bench_press",
+                "reps": 8,
+                "weight": 95,
+                "weight_unit": "lb",
+            }],
+        },
+    )
+
+    data = json.loads(result[0][0].text)
+    assert data["status"] == "needs_confirmation"
+    assert data["changes"][0]["set_index"] == 1
+    assert data["changes"][0]["after"]["exercise_name"] == "BARBELL_BENCH_PRESS"
+    assert data["changes"][0]["after"]["reps"] == 8
+    assert data["changes"][0]["after"]["weight_lb"] == 95.0
+    mock_garmin_client.client.put.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_strength_activity_sets_writes_full_payload_and_verifies(
+    app_with_activity_management, mock_garmin_client
+):
+    activity_id = 12345678901
+    current = _strength_sets_payload()
+    stored = _strength_sets_payload()
+    stored["exerciseSets"][2]["exercises"] = [{
+        "category": "SQUAT", "name": "BARBELL_BACK_SQUAT", "probability": 100.0
+    }]
+    stored["exerciseSets"][2]["repetitionCount"] = 5
+    stored["exerciseSets"][2]["weight"] = 102058.283
+    mock_garmin_client.get_activity.return_value = {
+        "activityTypeDTO": {"typeKey": "strength_training"}
+    }
+    mock_garmin_client.get_activity_exercise_sets.side_effect = [current, stored]
+    mock_garmin_client.garmin_connect_activity = "/activity-service/activity"
+
+    result = await app_with_activity_management.call_tool(
+        "update_strength_activity_sets",
+        {
+            "activity_id": activity_id,
+            "updates": [{
+                "set_index": 2,
+                "category": "SQUAT",
+                "exercise_name": "BARBELL_BACK_SQUAT",
+                "reps": 5,
+                "weight": 225,
+                "weight_unit": "lb",
+            }],
+            "confirm": True,
+        },
+    )
+
+    data = json.loads(result[0][0].text)
+    assert data["status"] == "success"
+    assert data["verified"] is True
+    payload = mock_garmin_client.client.put.call_args.kwargs["json"]
+    # REST timing and device message metadata survive the read-modify-write.
+    assert payload["exerciseSets"][1] == current["exerciseSets"][1]
+    assert payload["exerciseSets"][2]["weight"] == 102058.283
+    mock_garmin_client.client.put.assert_called_once_with(
+        "connectapi",
+        "/activity-service/activity/12345678901/exerciseSets",
+        json=payload,
+        api=True,
+    )
+    assert mock_garmin_client.get_activity_exercise_sets.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_update_strength_activity_sets_rejects_ambiguous_weight_unit(
+    app_with_activity_management, mock_garmin_client
+):
+    mock_garmin_client.get_activity.return_value = {
+        "activityTypeDTO": {"typeKey": "strength_training"}
+    }
+    mock_garmin_client.get_activity_exercise_sets.return_value = _strength_sets_payload()
+
+    result = await app_with_activity_management.call_tool(
+        "update_strength_activity_sets",
+        {
+            "activity_id": 12345678901,
+            "updates": [{"set_index": 1, "weight": 95}],
+            "confirm": True,
+        },
+    )
+
+    assert "weight_unit is required" in result[0][0].text
+    mock_garmin_client.client.put.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_strength_activity_sets_rejects_non_strength_activity(
+    app_with_activity_management, mock_garmin_client
+):
+    mock_garmin_client.get_activity.return_value = {
+        "activityTypeDTO": {"typeKey": "running"}
+    }
+
+    result = await app_with_activity_management.call_tool(
+        "update_strength_activity_sets",
+        {
+            "activity_id": 12345678901,
+            "updates": [{"set_index": 1, "reps": 8}],
+            "confirm": True,
+        },
+    )
+
+    assert "not 'strength_training'" in result[0][0].text
+    mock_garmin_client.get_activity_exercise_sets.assert_not_called()
+    mock_garmin_client.client.put.assert_not_called()
+
+
+def _single_active_set_payload(activity_id=12345678901, duration=300.0):
+    return {
+        "activityId": activity_id,
+        "exerciseSets": [{
+            "exercises": [{"category": "UNKNOWN", "name": None, "probability": 99.0}],
+            "duration": duration,
+            "repetitionCount": None,
+            "weight": None,
+            "setType": "ACTIVE",
+            "startTime": "2026-08-13T10:00:00.000",
+            "wktStepIndex": None,
+            "messageIndex": 7,
+        }],
+    }
+
+
+def _six_set_replacement():
+    return [
+        {
+            "category": "SHOULDER_PRESS",
+            "exercise_name": "DUMBBELL_SHOULDER_PRESS",
+            "duration_seconds": 30,
+            "weight": weight,
+            "weight_unit": "lb",
+        }
+        for weight in (0, 35, 55)
+    ] + [
+        {
+            "category": "SQUAT",
+            "exercise_name": "BARBELL_FRONT_SQUAT",
+            "reps": reps,
+            "weight": weight,
+            "weight_unit": "lb",
+        }
+        for reps, weight in ((5, 85), (5, 125), (3, 155))
+    ]
+
+
+@pytest.mark.asyncio
+async def test_update_strength_activity_sets_previews_expansion(
+    app_with_activity_management, mock_garmin_client
+):
+    mock_garmin_client.get_activity.return_value = {
+        "activityTypeDTO": {"typeKey": "strength_training"}
+    }
+    mock_garmin_client.get_activity_exercise_sets.return_value = (
+        _single_active_set_payload()
+    )
+
+    result = await app_with_activity_management.call_tool(
+        "update_strength_activity_sets",
+        {
+            "activity_id": 12345678901,
+            "replacement_sets": _six_set_replacement(),
+        },
+    )
+
+    data = json.loads(result[0][0].text)
+    assert data["status"] == "needs_confirmation"
+    assert data["mode"] == "replace"
+    assert data["changes"]["before"]["active_set_count"] == 1
+    after = data["changes"]["after"]
+    assert after["active_set_count"] == 6
+    assert after["total_set_count"] == 6
+    assert after["recorded_duration_seconds"] == 300.0
+    # Three explicit 30-second presses leave 210 seconds, divided across squats.
+    assert [item["duration_seconds"] for item in after["sets"]] == [
+        30.0, 30.0, 30.0, 70.0, 70.0, 70.0
+    ]
+    assert after["sets"][0]["weight_grams"] == 0.0
+    assert after["sets"][5]["reps"] == 3
+    mock_garmin_client.client.put.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_strength_activity_sets_applies_and_verifies_expansion(
+    app_with_activity_management, mock_garmin_client
+):
+    activity_id = 12345678901
+    current = _single_active_set_payload()
+    expected, _ = activity_management._prepare_strength_set_replacement(
+        activity_id, current, _six_set_replacement()
+    )
+    mock_garmin_client.get_activity.return_value = {
+        "activityTypeDTO": {"typeKey": "strength_training"}
+    }
+    mock_garmin_client.get_activity_exercise_sets.side_effect = [current, expected]
+    mock_garmin_client.garmin_connect_activity = "/activity-service/activity"
+
+    result = await app_with_activity_management.call_tool(
+        "update_strength_activity_sets",
+        {
+            "activity_id": activity_id,
+            "replacement_sets": _six_set_replacement(),
+            "confirm": True,
+        },
+    )
+
+    data = json.loads(result[0][0].text)
+    assert data["status"] == "success"
+    assert data["mode"] == "replace"
+    assert data["verified"] is True
+    payload = mock_garmin_client.client.put.call_args.kwargs["json"]
+    assert len(payload["exerciseSets"]) == 6
+    assert [item["messageIndex"] for item in payload["exerciseSets"]] == list(range(6))
+    assert payload["exerciseSets"][1]["startTime"] == "2026-08-13T10:00:30.000"
+
+
+@pytest.mark.asyncio
+async def test_update_strength_activity_sets_adds_trailing_rest_for_unallocated_time(
+    app_with_activity_management, mock_garmin_client
+):
+    mock_garmin_client.get_activity.return_value = {
+        "activityTypeDTO": {"typeKey": "strength_training"}
+    }
+    mock_garmin_client.get_activity_exercise_sets.return_value = (
+        _single_active_set_payload(duration=120.0)
+    )
+
+    result = await app_with_activity_management.call_tool(
+        "update_strength_activity_sets",
+        {
+            "activity_id": 12345678901,
+            "replacement_sets": [{
+                "category": "PLANK",
+                "exercise_name": "FRONT_PLANK",
+                "duration_seconds": 30,
+            }],
+        },
+    )
+
+    data = json.loads(result[0][0].text)
+    after = data["changes"]["after"]
+    assert after["active_set_count"] == 1
+    assert after["total_set_count"] == 2
+    assert after["generated_rest_set_count"] == 1
+    assert after["recorded_duration_seconds"] == 120.0
+
+
+@pytest.mark.asyncio
+async def test_update_strength_activity_sets_preserves_millisecond_duration(
+    app_with_activity_management, mock_garmin_client
+):
+    mock_garmin_client.get_activity.return_value = {
+        "activityTypeDTO": {"typeKey": "strength_training"}
+    }
+    mock_garmin_client.get_activity_exercise_sets.return_value = (
+        _single_active_set_payload(duration=100.001)
+    )
+
+    result = await app_with_activity_management.call_tool(
+        "update_strength_activity_sets",
+        {
+            "activity_id": 12345678901,
+            "replacement_sets": [
+                {
+                    "category": "SQUAT",
+                    "exercise_name": "BARBELL_FRONT_SQUAT",
+                    "reps": 5,
+                },
+                {
+                    "category": "SQUAT",
+                    "exercise_name": "BARBELL_FRONT_SQUAT",
+                    "reps": 3,
+                },
+                {
+                    "category": "SQUAT",
+                    "exercise_name": "BARBELL_FRONT_SQUAT",
+                    "reps": 1,
+                },
+            ],
+        },
+    )
+
+    data = json.loads(result[0][0].text)
+    assert data["changes"]["before"]["recorded_duration_seconds"] == 100.001
+    assert data["changes"]["after"]["recorded_duration_seconds"] == 100.001
+
+
+@pytest.mark.asyncio
+async def test_update_strength_activity_sets_rejects_replacement_over_duration(
+    app_with_activity_management, mock_garmin_client
+):
+    mock_garmin_client.get_activity.return_value = {
+        "activityTypeDTO": {"typeKey": "strength_training"}
+    }
+    mock_garmin_client.get_activity_exercise_sets.return_value = (
+        _single_active_set_payload(duration=30.0)
+    )
+
+    result = await app_with_activity_management.call_tool(
+        "update_strength_activity_sets",
+        {
+            "activity_id": 12345678901,
+            "replacement_sets": [{
+                "category": "PLANK",
+                "exercise_name": "FRONT_PLANK",
+                "duration_seconds": 45,
+            }],
+            "confirm": True,
+        },
+    )
+
+    assert "exceed the recorded exercise-set duration" in result[0][0].text
+    mock_garmin_client.client.put.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_strength_activity_sets_requires_exactly_one_mode(
+    app_with_activity_management, mock_garmin_client
+):
+    mock_garmin_client.get_activity.return_value = {
+        "activityTypeDTO": {"typeKey": "strength_training"}
+    }
+    mock_garmin_client.get_activity_exercise_sets.return_value = (
+        _single_active_set_payload()
+    )
+
+    result = await app_with_activity_management.call_tool(
+        "update_strength_activity_sets",
+        {"activity_id": 12345678901},
+    )
+
+    assert "exactly one of updates or replacement_sets" in result[0][0].text
+    mock_garmin_client.client.put.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_count_activities_tool(app_with_activity_management, mock_garmin_client):
     """Test count_activities tool returns total activity count"""

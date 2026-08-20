@@ -3,6 +3,9 @@ Activity Management functions for Garmin Connect MCP Server
 """
 import json
 import datetime
+import copy
+import math
+import re
 from typing import Any, Dict, List, Optional, Union
 
 # The garmin_client will be set by the main file
@@ -41,6 +44,496 @@ def _update_activity_summary(activity_id: int, fields: Dict[str, Any]) -> Any:
     sidesteps it.
     """
     return _put_activity_update(activity_id, {"summaryDTO": fields})
+
+
+_EXERCISE_KEY_RE = re.compile(r"^[A-Z0-9_]+$")
+_WEIGHT_UNIT_TO_GRAMS = {
+    "kg": 1000.0,
+    "kilogram": 1000.0,
+    "kilograms": 1000.0,
+    "lb": 453.59237,
+    "lbs": 453.59237,
+    "pound": 453.59237,
+    "pounds": 453.59237,
+}
+
+
+def _active_exercise_sets(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return ACTIVE sets in the order Garmin displays them."""
+    sets = data.get("exerciseSets")
+    if not isinstance(sets, list):
+        raise ValueError("Garmin returned an invalid exerciseSets payload")
+    return [item for item in sets if item.get("setType") == "ACTIVE"]
+
+
+def _exercise_set_summary(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Curate the editable fields from a Garmin exercise set."""
+    exercises = item.get("exercises") or []
+    selected = exercises[0] if exercises else {}
+    weight_grams = item.get("weight")
+    summary = {
+        "category": selected.get("category"),
+        "exercise_name": selected.get("name"),
+        "reps": item.get("repetitionCount"),
+        "duration_seconds": item.get("duration"),
+        "weight_grams": weight_grams,
+    }
+    if isinstance(weight_grams, (int, float)) and not isinstance(weight_grams, bool):
+        summary["weight_kg"] = round(float(weight_grams) / 1000.0, 4)
+        summary["weight_lb"] = round(float(weight_grams) / 453.59237, 4)
+    return summary
+
+
+def _normalize_exercise_key(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a non-empty Garmin exercise key")
+    normalized = value.strip().upper()
+    if not _EXERCISE_KEY_RE.fullmatch(normalized):
+        raise ValueError(
+            f"{field} must contain only letters, numbers, and underscores"
+        )
+    return normalized
+
+
+def _prepare_strength_set_update(
+    activity_id: int,
+    current: Dict[str, Any],
+    updates: List[Dict[str, Any]],
+) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """Merge user edits into Garmin's full exercise-set payload.
+
+    Garmin requires the complete exerciseSets document on PUT. Rest sets and
+    timing/message metadata are therefore preserved exactly; callers address
+    only ACTIVE sets using a one-based set_index.
+    """
+    if not isinstance(updates, list) or not updates:
+        raise ValueError("updates must contain at least one set update")
+
+    payload = copy.deepcopy(current)
+    payload["activityId"] = activity_id
+    active_sets = _active_exercise_sets(payload)
+    if not active_sets:
+        raise ValueError("This activity has no ACTIVE exercise sets to update")
+
+    seen_indexes = set()
+    changes: List[Dict[str, Any]] = []
+    editable_fields = {
+        "category", "exercise_name", "reps", "weight", "weight_unit"
+    }
+
+    for position, update in enumerate(updates, start=1):
+        if not isinstance(update, dict):
+            raise ValueError(f"updates[{position}] must be an object")
+
+        raw_index = update.get("set_index")
+        if isinstance(raw_index, bool):
+            raise ValueError(f"updates[{position}].set_index must be an integer")
+        try:
+            set_index = int(raw_index)
+        except (TypeError, ValueError):
+            raise ValueError(f"updates[{position}].set_index must be an integer")
+        if set_index < 1 or set_index > len(active_sets):
+            raise ValueError(
+                f"updates[{position}].set_index must be between 1 and "
+                f"{len(active_sets)} (ACTIVE sets only)"
+            )
+        if set_index in seen_indexes:
+            raise ValueError(f"set_index {set_index} is duplicated")
+        seen_indexes.add(set_index)
+
+        supplied = editable_fields.intersection(update)
+        if not supplied:
+            raise ValueError(
+                f"updates[{position}] must change exercise, reps, or weight"
+            )
+
+        item = active_sets[set_index - 1]
+        before = _exercise_set_summary(item)
+
+        has_category = "category" in update
+        has_name = "exercise_name" in update
+        if has_category != has_name:
+            raise ValueError(
+                f"updates[{position}] must provide category and exercise_name together"
+            )
+        if has_category:
+            category = update["category"]
+            exercise_name = update["exercise_name"]
+            if category is None and exercise_name is None:
+                item["exercises"] = []
+            elif category is None or exercise_name is None:
+                raise ValueError(
+                    f"updates[{position}] must set or clear category and "
+                    "exercise_name together"
+                )
+            else:
+                item["exercises"] = [{
+                    "category": _normalize_exercise_key(category, "category"),
+                    "name": _normalize_exercise_key(exercise_name, "exercise_name"),
+                    "probability": 100.0,
+                }]
+
+        if "reps" in update:
+            reps = update["reps"]
+            if reps is None:
+                item["repetitionCount"] = None
+            elif isinstance(reps, bool) or not isinstance(reps, int) or reps < 1:
+                raise ValueError(f"updates[{position}].reps must be a positive integer")
+            else:
+                item["repetitionCount"] = reps
+
+        has_weight = "weight" in update
+        has_weight_unit = "weight_unit" in update
+        if has_weight:
+            weight = update["weight"]
+            if weight is None:
+                item["weight"] = None
+                if has_weight_unit and update["weight_unit"] is not None:
+                    raise ValueError(
+                        f"updates[{position}].weight_unit must be omitted when clearing weight"
+                    )
+            else:
+                if isinstance(weight, bool) or not isinstance(weight, (int, float)):
+                    raise ValueError(f"updates[{position}].weight must be numeric")
+                if not math.isfinite(float(weight)) or float(weight) < 0:
+                    raise ValueError(f"updates[{position}].weight cannot be negative")
+                if not has_weight_unit:
+                    raise ValueError(
+                        f"updates[{position}].weight_unit is required with weight"
+                    )
+                unit = str(update["weight_unit"]).strip().lower()
+                factor = _WEIGHT_UNIT_TO_GRAMS.get(unit)
+                if factor is None:
+                    raise ValueError(
+                        f"updates[{position}].weight_unit must be kg or lb"
+                    )
+                item["weight"] = round(float(weight) * factor, 3)
+        elif has_weight_unit:
+            raise ValueError(
+                f"updates[{position}].weight_unit cannot be provided without weight"
+            )
+
+        after = _exercise_set_summary(item)
+        if before != after:
+            changes.append({"set_index": set_index, "before": before, "after": after})
+
+    return payload, changes
+
+
+def _positive_number(value: Any, field: str, allow_zero: bool = False) -> float:
+    """Validate a finite numeric input without accepting booleans."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} must be numeric")
+    number = float(value)
+    minimum_ok = number >= 0 if allow_zero else number > 0
+    if not math.isfinite(number) or not minimum_ok:
+        qualifier = "non-negative" if allow_zero else "greater than zero"
+        raise ValueError(f"{field} must be {qualifier}")
+    return number
+
+
+def _parse_garmin_timestamp(value: Any) -> datetime.datetime:
+    if not isinstance(value, str) or not value:
+        raise ValueError("Garmin exercise sets have no usable startTime")
+    try:
+        return datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"Garmin returned an invalid set startTime: {value!r}") from exc
+
+
+def _format_garmin_timestamp(value: datetime.datetime) -> str:
+    """Use the millisecond precision returned by Garmin's exercise-set API."""
+    rendered = value.isoformat(timespec="milliseconds")
+    return rendered.replace("+00:00", "Z")
+
+
+def _replacement_set_summary(item: Dict[str, Any], index: int) -> Dict[str, Any]:
+    summary = {"set_index": index, **_exercise_set_summary(item)}
+    summary["start_time"] = item.get("startTime")
+    return summary
+
+
+def _prepare_strength_set_replacement(
+    activity_id: int,
+    current: Dict[str, Any],
+    replacements: List[Dict[str, Any]],
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Replace all recorded sets with a synthesized, duration-preserving timeline.
+
+    Explicit set durations and rests are honored. Any remaining recorded time is
+    divided evenly among replacement sets whose duration_seconds is omitted. If
+    every duration is explicit, leftover time becomes a trailing REST set.
+    """
+    if not isinstance(replacements, list) or not replacements:
+        raise ValueError("replacement_sets must contain at least one set")
+    if len(replacements) > 200:
+        raise ValueError("replacement_sets cannot contain more than 200 sets")
+
+    original_sets = current.get("exerciseSets")
+    if not isinstance(original_sets, list) or not original_sets:
+        raise ValueError("This activity has no exercise sets to replace")
+    active_original = _active_exercise_sets(current)
+    if not active_original:
+        raise ValueError("This activity has no ACTIVE exercise sets to replace")
+
+    first_start = _parse_garmin_timestamp(original_sets[0].get("startTime"))
+    recorded_duration = 0.0
+    for index, item in enumerate(original_sets, start=1):
+        recorded_duration += _positive_number(
+            item.get("duration"), f"existing exerciseSets[{index}].duration",
+            allow_zero=True,
+        )
+    if recorded_duration <= 0:
+        raise ValueError("The recorded exercise-set duration must be greater than zero")
+
+    normalized: List[Dict[str, Any]] = []
+    explicit_duration = 0.0
+    total_rest = 0.0
+    missing_duration_indexes: List[int] = []
+    for position, proposed in enumerate(replacements, start=1):
+        if not isinstance(proposed, dict):
+            raise ValueError(f"replacement_sets[{position}] must be an object")
+        category = _normalize_exercise_key(
+            proposed.get("category"), f"replacement_sets[{position}].category"
+        )
+        exercise_name = _normalize_exercise_key(
+            proposed.get("exercise_name"),
+            f"replacement_sets[{position}].exercise_name",
+        )
+
+        reps = proposed.get("reps")
+        if reps is not None and (
+            isinstance(reps, bool) or not isinstance(reps, int) or reps < 1
+        ):
+            raise ValueError(
+                f"replacement_sets[{position}].reps must be a positive integer"
+            )
+        duration = proposed.get("duration_seconds")
+        if duration is None:
+            if reps is None:
+                raise ValueError(
+                    f"replacement_sets[{position}] requires reps or duration_seconds"
+                )
+            missing_duration_indexes.append(position - 1)
+        else:
+            duration = _positive_number(
+                duration, f"replacement_sets[{position}].duration_seconds"
+            )
+            explicit_duration += duration
+
+        weight = proposed.get("weight")
+        has_weight = "weight" in proposed
+        has_unit = "weight_unit" in proposed
+        weight_grams = None
+        if has_weight and weight is not None:
+            weight = _positive_number(
+                weight, f"replacement_sets[{position}].weight", allow_zero=True
+            )
+            if not has_unit:
+                raise ValueError(
+                    f"replacement_sets[{position}].weight_unit is required with weight"
+                )
+            unit = str(proposed["weight_unit"]).strip().lower()
+            factor = _WEIGHT_UNIT_TO_GRAMS.get(unit)
+            if factor is None:
+                raise ValueError(
+                    f"replacement_sets[{position}].weight_unit must be kg or lb"
+                )
+            weight_grams = round(weight * factor, 3)
+        elif has_unit:
+            raise ValueError(
+                f"replacement_sets[{position}].weight_unit cannot be provided "
+                "without a numeric weight"
+            )
+
+        rest = proposed.get("rest_seconds_after", 0)
+        rest = _positive_number(
+            rest, f"replacement_sets[{position}].rest_seconds_after", allow_zero=True
+        )
+        total_rest += rest
+        normalized.append({
+            "category": category,
+            "exercise_name": exercise_name,
+            "reps": reps,
+            "duration": duration,
+            "weight_grams": weight_grams,
+            "rest": rest,
+        })
+
+    remaining = recorded_duration - explicit_duration - total_rest
+    if remaining < -0.001:
+        raise ValueError(
+            "Replacement durations and rests exceed the recorded exercise-set "
+            f"duration ({recorded_duration:.3f}s)"
+        )
+    remaining = max(0.0, remaining)
+    if missing_duration_indexes:
+        if remaining <= 0:
+            raise ValueError("No recorded duration remains for sets without duration_seconds")
+        share = remaining / len(missing_duration_indexes)
+        for index in missing_duration_indexes:
+            normalized[index]["duration"] = share
+        trailing_rest = 0.0
+    else:
+        trailing_rest = remaining
+
+    template = copy.deepcopy(active_original[0])
+    generated: List[Dict[str, Any]] = []
+    cursor = first_start
+
+    def append_set(item: Dict[str, Any]) -> None:
+        item["messageIndex"] = len(generated)
+        item["startTime"] = _format_garmin_timestamp(cursor)
+        generated.append(item)
+
+    for proposed in normalized:
+        active = copy.deepcopy(template)
+        active.update({
+            "exercises": [{
+                "category": proposed["category"],
+                "name": proposed["exercise_name"],
+                "probability": 100.0,
+            }],
+            "duration": round(proposed["duration"], 3),
+            "repetitionCount": proposed["reps"],
+            "weight": proposed["weight_grams"],
+            "setType": "ACTIVE",
+            "wktStepIndex": None,
+        })
+        append_set(active)
+        cursor += datetime.timedelta(seconds=proposed["duration"])
+
+        if proposed["rest"] > 0:
+            rest = copy.deepcopy(template)
+            rest.update({
+                "exercises": [],
+                "duration": round(proposed["rest"], 3),
+                "repetitionCount": None,
+                "weight": None,
+                "setType": "REST",
+                "wktStepIndex": None,
+            })
+            append_set(rest)
+            cursor += datetime.timedelta(seconds=proposed["rest"])
+
+    if trailing_rest > 0.001:
+        rest = copy.deepcopy(template)
+        rest.update({
+            "exercises": [],
+            "duration": round(trailing_rest, 3),
+            "repetitionCount": None,
+            "weight": None,
+            "setType": "REST",
+            "wktStepIndex": None,
+        })
+        append_set(rest)
+
+    # Garmin represents set duration to millisecond precision. Correct the tiny
+    # rounding residual on the final set so the serialized timeline sums to the
+    # original recorded duration exactly at that precision.
+    target_duration = round(recorded_duration, 3)
+    serialized_duration = round(
+        sum(float(item["duration"]) for item in generated), 3
+    )
+    residual = round(target_duration - serialized_duration, 3)
+    if residual:
+        corrected = round(float(generated[-1]["duration"]) + residual, 3)
+        if corrected <= 0:
+            raise ValueError("Replacement duration rounding produced an invalid set")
+        generated[-1]["duration"] = corrected
+
+    payload = copy.deepcopy(current)
+    payload["activityId"] = activity_id
+    payload["exerciseSets"] = generated
+    preview = {
+        "before": {
+            "active_set_count": len(active_original),
+            "total_set_count": len(original_sets),
+            "recorded_duration_seconds": round(recorded_duration, 3),
+        },
+        "after": {
+            "active_set_count": len(normalized),
+            "total_set_count": len(generated),
+            "recorded_duration_seconds": round(
+                sum(float(item["duration"]) for item in generated), 3
+            ),
+            "sets": [
+                _replacement_set_summary(item, index)
+                for index, item in enumerate(_active_exercise_sets(payload), start=1)
+            ],
+            "generated_rest_set_count": sum(
+                item.get("setType") == "REST" for item in generated
+            ),
+        },
+    }
+    return payload, preview
+
+
+def _strength_updates_verified(
+    expected: Dict[str, Any], actual: Dict[str, Any], indexes: List[int]
+) -> bool:
+    """Check the edited fields after Garmin has stored the payload."""
+    expected_sets = _active_exercise_sets(expected)
+    actual_sets = _active_exercise_sets(actual)
+    if len(expected_sets) != len(actual_sets):
+        return False
+    for index in indexes:
+        wanted = _exercise_set_summary(expected_sets[index - 1])
+        stored = _exercise_set_summary(actual_sets[index - 1])
+        if any(
+            wanted.get(field) != stored.get(field)
+            for field in ("category", "exercise_name", "reps")
+        ):
+            return False
+        wanted_weight = wanted.get("weight_grams")
+        stored_weight = stored.get("weight_grams")
+        if wanted_weight is None or stored_weight is None:
+            if wanted_weight != stored_weight:
+                return False
+        elif not math.isclose(
+            float(wanted_weight), float(stored_weight), abs_tol=1.0
+        ):
+            return False
+        wanted_duration = wanted.get("duration_seconds")
+        stored_duration = stored.get("duration_seconds")
+        if wanted_duration is None or stored_duration is None:
+            if wanted_duration != stored_duration:
+                return False
+        elif not math.isclose(
+            float(wanted_duration), float(stored_duration), abs_tol=0.01
+        ):
+            return False
+    return True
+
+
+def _strength_replacement_verified(
+    expected: Dict[str, Any], actual: Dict[str, Any]
+) -> bool:
+    """Verify both ACTIVE contents and the synthesized ACTIVE/REST timeline."""
+    expected_all = expected.get("exerciseSets") or []
+    actual_all = actual.get("exerciseSets") or []
+    if len(expected_all) != len(actual_all):
+        return False
+    if not _strength_updates_verified(
+        expected,
+        actual,
+        list(range(1, len(_active_exercise_sets(expected)) + 1)),
+    ):
+        return False
+    for wanted, stored in zip(expected_all, actual_all):
+        if wanted.get("setType") != stored.get("setType"):
+            return False
+        wanted_duration = wanted.get("duration")
+        stored_duration = stored.get("duration")
+        if not isinstance(wanted_duration, (int, float)) or not isinstance(
+            stored_duration, (int, float)
+        ):
+            return False
+        if not math.isclose(
+            float(wanted_duration), float(stored_duration), abs_tol=0.01
+        ):
+            return False
+    return True
 
 
 def register_tools(app):
@@ -807,6 +1300,150 @@ def register_tools(app):
             return json.dumps(exercise_sets, indent=2)
         except Exception as e:
             return f"Error retrieving activity exercise sets: {str(e)}"
+
+    @app.tool()
+    async def update_strength_activity_sets(
+        activity_id: Union[int, str],
+        updates: Optional[List[Dict[str, Any]]] = None,
+        replacement_sets: Optional[List[Dict[str, Any]]] = None,
+        confirm: bool = False,
+    ) -> str:
+        """Preview or apply edits to a completed strength activity's sets.
+
+        Exactly one edit mode must be supplied:
+        - updates edits existing ACTIVE sets one-for-one while preserving all REST
+          sets, timestamps, durations, and device metadata. Set indexes are one-based
+          and count ACTIVE sets only.
+        - replacement_sets replaces the complete set timeline and can expand one
+          recorded ACTIVE set into many. It preserves the original total exercise-set
+          duration, synthesizes sequential timestamps, and optionally inserts rests.
+
+        Safety flow:
+        1. Call with confirm=false (the default) to receive a proposed before/after diff.
+        2. Show that diff to the user and obtain confirmation.
+        3. Call again with the same activity_id and updates plus confirm=true.
+
+        Each item in updates requires set_index and editable values:
+        - category + exercise_name: Garmin catalog keys such as BENCH_PRESS and
+          BARBELL_BENCH_PRESS. They must be supplied together. Set both to null to
+          clear the exercise assignment.
+        - reps: positive integer, or null to clear.
+        - weight + weight_unit: positive number with unit "kg" or "lb". Garmin
+          stores weight internally as grams. Set weight to null to clear it.
+
+        Example existing-set edit:
+        updates=[
+          {"set_index": 1, "category": "BENCH_PRESS",
+           "exercise_name": "BARBELL_BENCH_PRESS", "reps": 8,
+           "weight": 95, "weight_unit": "lb"},
+          {"set_index": 2, "category": "BENCH_PRESS",
+           "exercise_name": "BARBELL_BENCH_PRESS", "reps": 8,
+           "weight": 95, "weight_unit": "lb"}
+        ]
+
+        Each item in replacement_sets requires category and exercise_name plus reps,
+        duration_seconds, or both. duration_seconds is the recorded time occupied by
+        that set, not its rep prescription. For rep-based sets it may be omitted; the
+        remaining original duration is divided evenly among sets that omit it.
+        rest_seconds_after optionally inserts a REST set. When every active-set
+        duration is explicit, any unallocated original time becomes a trailing REST
+        set so the activity's recorded duration is not changed. Weight may be zero
+        for bodyweight/unloaded work.
+
+        Example full replacement/expansion:
+        replacement_sets=[
+          {"category": "SHOULDER_PRESS", "exercise_name": "DUMBBELL_SHOULDER_PRESS",
+           "duration_seconds": 30, "weight": 0, "weight_unit": "lb"},
+          {"category": "SQUAT", "exercise_name": "BARBELL_FRONT_SQUAT",
+           "reps": 5, "weight": 85, "weight_unit": "lb"}
+        ]
+
+        Args:
+            activity_id: Completed strength activity ID.
+            updates: Partial edits keyed by one-based ACTIVE set_index.
+            replacement_sets: Ordered definition of all desired ACTIVE sets.
+            confirm: False previews only; True writes to Garmin and verifies the result.
+        """
+        try:
+            activity_id = int(activity_id)
+            if activity_id <= 0:
+                raise ValueError("activity_id must be a positive integer")
+
+            activity = garmin_client.get_activity(activity_id)
+            activity_type = (activity.get("activityTypeDTO") or {}).get("typeKey")
+            if activity_type != "strength_training":
+                return (
+                    f"Activity {activity_id} is type {activity_type!r}, not "
+                    "'strength_training'; no changes were made"
+                )
+
+            current = garmin_client.get_activity_exercise_sets(activity_id)
+            if not current:
+                return f"No exercise sets found for activity with ID {activity_id}"
+
+            if (updates is None) == (replacement_sets is None):
+                raise ValueError(
+                    "Provide exactly one of updates or replacement_sets"
+                )
+
+            if replacement_sets is not None:
+                mode = "replace"
+                payload, preview = _prepare_strength_set_replacement(
+                    activity_id, current, replacement_sets
+                )
+                changes: Any = preview
+                indexes = list(range(1, len(_active_exercise_sets(payload)) + 1))
+            else:
+                mode = "update"
+                payload, changes = _prepare_strength_set_update(
+                    activity_id, current, updates
+                )
+                indexes = [change["set_index"] for change in changes]
+                if not changes:
+                    return json.dumps({
+                        "status": "no_changes",
+                        "activity_id": activity_id,
+                        "message": "The requested values already match Garmin.",
+                    }, indent=2)
+
+            if not confirm:
+                return json.dumps({
+                    "status": "needs_confirmation",
+                    "activity_id": activity_id,
+                    "mode": mode,
+                    "changes": changes,
+                    "message": (
+                        "Review these changes with the user, then call again with "
+                        "the same updates and confirm=true to write them."
+                    ),
+                }, indent=2)
+
+            url = f"{garmin_client.garmin_connect_activity}/{activity_id}/exerciseSets"
+            garmin_client.client.put(
+                "connectapi", url, json=payload, api=True
+            )
+
+            stored = garmin_client.get_activity_exercise_sets(activity_id)
+            verified = (
+                _strength_replacement_verified(payload, stored)
+                if mode == "replace"
+                else _strength_updates_verified(payload, stored, indexes)
+            )
+            return json.dumps({
+                "status": "success" if verified else "verification_failed",
+                "activity_id": activity_id,
+                "mode": mode,
+                "verified": verified,
+                "changes": changes,
+                "message": (
+                    "Strength exercise sets updated and verified."
+                    if verified else
+                    "Garmin accepted the update, but the stored sets did not match. "
+                    "Re-read the activity before retrying."
+                ),
+            }, indent=2)
+        except Exception as e:
+            return f"Error updating strength activity sets: {str(e)}"
 
     @app.tool()
     async def count_activities() -> str:

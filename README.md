@@ -27,7 +27,7 @@ Garmin's API is accessed via the awesome [python-garminconnect](https://github.c
 
 This MCP server implements **110+ tools** covering ~90% of the [python-garminconnect](https://github.com/cyberjunky/python-garminconnect) library (v0.3.2):
 
-- ✅ Activity Management (20 tools) - includes write tools for type, description, event type, perceived effort, and feel
+- ✅ Activity Management (21 tools) - includes write tools for strength exercise sets, type, description, event type, perceived effort, and feel
 - ✅ Health & Wellness (31 tools) - includes custom lightweight summary tools
 - ✅ Training & Performance (13 tools) - includes CTL/ATL/TSB, HRV, VO2 max, and respiration trends
 - ✅ Workouts (8 tools)
@@ -59,6 +59,77 @@ Two tools let you download a raw activity file to disk:
 3. Persisted config set via `set_fit_download_dir`.
 
 **First-run behavior:** if no directory is configured, `download_activity_file` returns `status: "needs_setup"`. The assistant will ask where you want to save files (suggesting the current directory as default), call `set_fit_download_dir` to persist your choice, and then retry the download automatically.
+
+### Editing completed strength activities
+
+`update_strength_activity_sets` updates the movement, reps, and weight recorded in
+a completed strength activity. It has two mutually exclusive modes:
+
+- `updates` edits existing ACTIVE sets one-for-one while preserving Garmin's REST
+  sets, timing, and device metadata.
+- `replacement_sets` replaces the set timeline and can expand one continuous
+  recorded set into multiple timed or rep-based sets.
+
+Both modes use a mandatory preview/confirmation flow:
+
+1. Call without `confirm` to receive a before/after diff; no data is written.
+2. Review the diff with the user.
+3. Repeat the same call with `confirm=true` to write and verify the changes.
+
+Set indexes are one-based and count ACTIVE sets only. Exercise identifiers must be
+Garmin catalog keys; weight units can be `lb` or `kg`.
+
+```json
+{
+  "activity_id": 23939419991,
+  "updates": [
+    {
+      "set_index": 1,
+      "category": "BENCH_PRESS",
+      "exercise_name": "BARBELL_BENCH_PRESS",
+      "reps": 8,
+      "weight": 95,
+      "weight_unit": "lb"
+    }
+  ]
+}
+```
+
+The write call sends the complete exercise-set document back to Garmin because
+the endpoint does not support a partial set update. Always preview immediately
+before confirming so edits are merged with the latest stored activity.
+
+To replace one continuous recorded set with an ordered routine, pass
+`replacement_sets` instead of `updates`:
+
+```json
+{
+  "activity_id": 23939419991,
+  "replacement_sets": [
+    {
+      "category": "SHOULDER_PRESS",
+      "exercise_name": "DUMBBELL_SHOULDER_PRESS",
+      "duration_seconds": 30,
+      "weight": 0,
+      "weight_unit": "lb"
+    },
+    {
+      "category": "SQUAT",
+      "exercise_name": "BARBELL_FRONT_SQUAT",
+      "reps": 5,
+      "weight": 85,
+      "weight_unit": "lb"
+    }
+  ]
+}
+```
+
+Every replacement needs a Garmin `category` and `exercise_name`, and either
+`reps`, `duration_seconds`, or both. Use `rest_seconds_after` to insert a REST
+set. If rep-based sets omit `duration_seconds`, the tool evenly distributes the
+unallocated recorded time among them. If every duration is explicit, leftover
+time becomes a trailing REST set. The preview shows this synthesized timeline
+before any write, and the total recorded exercise-set duration is never changed.
 
 ### Intentionally Skipped Endpoints
 
