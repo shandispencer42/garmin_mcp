@@ -1308,7 +1308,7 @@ def register_tools(app):
         replacement_sets: Optional[List[Dict[str, Any]]] = None,
         confirm: bool = False,
     ) -> str:
-        """Preview or apply edits to a completed strength activity's sets.
+        """Preview or apply edits to a completed strength_training or hiit activity's sets.
 
         Exactly one edit mode must be supplied:
         - updates edits existing ACTIVE sets one-for-one while preserving all REST
@@ -1359,7 +1359,7 @@ def register_tools(app):
         ]
 
         Args:
-            activity_id: Completed strength activity ID.
+            activity_id: Completed strength_training or hiit activity ID.
             updates: Partial edits keyed by one-based ACTIVE set_index.
             replacement_sets: Ordered definition of all desired ACTIVE sets.
             confirm: False previews only; True writes to Garmin and verifies the result.
@@ -1371,10 +1371,12 @@ def register_tools(app):
 
             activity = garmin_client.get_activity(activity_id)
             activity_type = (activity.get("activityTypeDTO") or {}).get("typeKey")
-            if activity_type != "strength_training":
+            allowed_activity_types = {"strength_training", "hiit"}
+            if activity_type not in allowed_activity_types:
+                allowed_display = ", ".join(sorted(f"'{t}'" for t in allowed_activity_types))
                 return (
-                    f"Activity {activity_id} is type {activity_type!r}, not "
-                    "'strength_training'; no changes were made"
+                    f"Activity {activity_id} is type {activity_type!r}, not one of "
+                    f"{allowed_display}; no changes were made"
                 )
 
             current = garmin_client.get_activity_exercise_sets(activity_id)

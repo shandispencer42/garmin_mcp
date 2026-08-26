@@ -60,10 +60,11 @@ Two tools let you download a raw activity file to disk:
 
 **First-run behavior:** if no directory is configured, `download_activity_file` returns `status: "needs_setup"`. The assistant will ask where you want to save files (suggesting the current directory as default), call `set_fit_download_dir` to persist your choice, and then retry the download automatically.
 
-### Editing completed strength activities
+### Editing completed strength or HIIT activities
 
 `update_strength_activity_sets` updates the movement, reps, and weight recorded in
-a completed strength activity. It has two mutually exclusive modes:
+a completed `strength_training` or `hiit` activity (e.g. a CrossFit-style workout
+Garmin classified as HIIT). It has two mutually exclusive modes:
 
 - `updates` edits existing ACTIVE sets one-for-one while preserving Garmin's REST
   sets, timing, and device metadata.

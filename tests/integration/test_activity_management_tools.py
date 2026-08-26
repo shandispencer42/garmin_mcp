@@ -772,9 +772,33 @@ async def test_update_strength_activity_sets_rejects_non_strength_activity(
         },
     )
 
-    assert "not 'strength_training'" in result[0][0].text
+    assert "not one of" in result[0][0].text
+    assert "'hiit'" in result[0][0].text
+    assert "'strength_training'" in result[0][0].text
     mock_garmin_client.get_activity_exercise_sets.assert_not_called()
     mock_garmin_client.client.put.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_strength_activity_sets_accepts_hiit_activity(
+    app_with_activity_management, mock_garmin_client
+):
+    mock_garmin_client.get_activity.return_value = {
+        "activityTypeDTO": {"typeKey": "hiit"}
+    }
+    mock_garmin_client.get_activity_exercise_sets.return_value = _single_active_set_payload()
+
+    result = await app_with_activity_management.call_tool(
+        "update_strength_activity_sets",
+        {
+            "activity_id": 12345678901,
+            "updates": [{"set_index": 1, "reps": 8}],
+            "confirm": False,
+        },
+    )
+
+    assert "not one of" not in result[0][0].text
+    mock_garmin_client.get_activity_exercise_sets.assert_called_once()
 
 
 def _single_active_set_payload(activity_id=12345678901, duration=300.0):
