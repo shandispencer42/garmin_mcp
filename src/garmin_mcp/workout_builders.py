@@ -255,6 +255,47 @@ def build_z2_walk_json(
     }
 
 
+# Accepted weight_unit inputs mapped to the unitKey Garmin stores. Garmin
+# backfills unitId/factor from unitKey alone. weightValue is expressed in this
+# unit; "kilogram" round-trips exactly, "pound" drifts <0.01 because Garmin
+# keeps the value in grams internally.
+_WEIGHT_UNITS = {
+    "lb": "pound",
+    "lbs": "pound",
+    "pound": "pound",
+    "pounds": "pound",
+    "kg": "kilogram",
+    "kgs": "kilogram",
+    "kilogram": "kilogram",
+    "kilograms": "kilogram",
+}
+
+
+def _strength_weight_fields(ex: Dict[str, Any], ex_name: str) -> Dict[str, Any]:
+    """Return {"weightValue", "weightUnit"} for an exercise, or {} when no weight.
+
+    Mirrors the web editor's Weight -> Type "Manual Weight" option, which just
+    sets weightValue + weightUnit on the step (there is no separate weight-type
+    discriminator).
+    """
+    weight = ex.get("weight")
+    if weight is None:
+        return {}
+    if isinstance(weight, bool) or not isinstance(weight, (int, float)):
+        raise ValueError(f"weight for exercise {ex_name!r} must be a number")
+    if weight <= 0:
+        raise ValueError(f"weight for exercise {ex_name!r} must be positive")
+
+    unit_raw = str(ex.get("weight_unit", "pound")).strip().lower()
+    unit_key = _WEIGHT_UNITS.get(unit_raw)
+    if unit_key is None:
+        raise ValueError(
+            f"weight_unit for exercise {ex_name!r} must be one of "
+            "lb, lbs, pound, kg, kilogram"
+        )
+    return {"weightValue": float(weight), "weightUnit": {"unitKey": unit_key}}
+
+
 def build_strength_json(
     name: str,
     exercises: List[Dict[str, Any]],
@@ -272,6 +313,10 @@ def build_strength_json(
     and rejects anything outside it, including "UNASSIGNED" and "OTHER"; omitting the
     key is accepted. Valid values come from Garmin's published catalog:
     https://connect.garmin.com/web-data/exercises/Exercises.json
+
+    "weight" is optional. When given (a positive number), the step gets a manual
+    target weight; "weight_unit" accepts lb/lbs/pound or kg/kilogram and defaults
+    to pound.
     """
     steps: List[dict] = []
     step_order = 1
@@ -304,6 +349,8 @@ def build_strength_json(
                     f"category for exercise {ex_name!r} must be a non-empty string"
                 )
             step["category"] = category.strip().upper()
+
+        step.update(_strength_weight_fields(ex, ex_name))
 
         steps.append(step)
         step_order += 1
@@ -493,13 +540,16 @@ def register_tools(app):
 
         Args:
             name: Workout name
-            exercises: List of dicts with keys: name, sets, reps, rest_seconds and an
-                optional category. Category is omitted from the payload when not
-                given; Garmin accepts that. When given it must be one of Garmin's
-                exercise categories (e.g. SQUAT, DEADLIFT, PUSH_UP, CARRY, SLED) —
-                anything else, including "UNASSIGNED" and "OTHER", is rejected with
-                400 Invalid category. Full list:
+            exercises: List of dicts with keys: name, sets, reps, rest_seconds and
+                optional category, weight, weight_unit. Category is omitted from the
+                payload when not given; Garmin accepts that. When given it must be
+                one of Garmin's exercise categories (e.g. SQUAT, DEADLIFT, PUSH_UP,
+                CARRY, SLED) — anything else, including "UNASSIGNED" and "OTHER", is
+                rejected with 400 Invalid category. Full list:
                 https://connect.garmin.com/web-data/exercises/Exercises.json
+                weight is an optional positive number giving the step's manual
+                target weight; weight_unit accepts lb/lbs/pound or kg/kilogram and
+                defaults to pound.
         """
         try:
             workout_json = build_strength_json(name=name, exercises=exercises)

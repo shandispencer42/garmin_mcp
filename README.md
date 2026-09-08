@@ -259,6 +259,11 @@ categories — anything else, including `OTHER` and `UNASSIGNED`, is rejected wi
 `400 - Invalid category`. The full list is published at
 [`Exercises.json`](https://connect.garmin.com/web-data/exercises/Exercises.json).
 
+`weight` is optional. Supply a positive number and the step gets a manual target weight
+(the web editor's Weight → Type → "Manual Weight"); `weight_unit` accepts `lb`/`lbs`/`pound`
+or `kg`/`kilogram` and defaults to pound. Garmin stores the value in grams internally, so a
+pound weight round-trips with a sub-0.01 lb drift; kilograms are exact.
+
 ```json
 {
   "name": "Full Body A",
@@ -266,7 +271,8 @@ categories — anything else, including `OTHER` and `UNASSIGNED`, is rejected wi
     {"name": "Sentadillas", "sets": 3, "reps": 12, "rest_seconds": 90},
     {"name": "Flexiones",   "sets": 3, "reps": 15, "rest_seconds": 60},
     {"name": "Peso muerto", "sets": 3, "reps": 10, "rest_seconds": 90},
-    {"name": "Farmers Carry 40m", "sets": 3, "reps": 1, "rest_seconds": 90, "category": "CARRY"}
+    {"name": "Farmers Carry 40m", "sets": 3, "reps": 1, "rest_seconds": 90, "category": "CARRY"},
+    {"name": "Bench Press", "sets": 3, "reps": 5, "category": "BENCH_PRESS", "weight": 135, "weight_unit": "lb"}
   ]
 }
 ```

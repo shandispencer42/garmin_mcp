@@ -181,3 +181,65 @@ def test_strength_rejects_empty_category():
                 name="Bad",
                 exercises=[{"name": "Back Squat", "sets": 1, "reps": 1, "category": bad}],
             )
+
+
+# ---------------------------------------------------------------------------
+# Strength step manual weight (weightValue / weightUnit)
+# ---------------------------------------------------------------------------
+
+
+def test_strength_omits_weight_when_not_supplied():
+    result = build_strength_json(
+        name="No weight",
+        exercises=[{"name": "Back Squat", "sets": 3, "reps": 5}],
+    )
+    step = _work_steps(result)[0]
+    assert "weightValue" not in step
+    assert "weightUnit" not in step
+
+
+def test_strength_emits_manual_weight_default_pound():
+    result = build_strength_json(
+        name="Bench day",
+        exercises=[
+            {"name": "Bench", "sets": 3, "reps": 5, "weight": 135},
+            {"name": "Row", "sets": 3, "reps": 8, "weight": 60, "weight_unit": "kg"},
+        ],
+    )
+    bench, row = _work_steps(result)
+    assert bench["weightValue"] == 135.0
+    assert bench["weightUnit"] == {"unitKey": "pound"}
+    assert row["weightValue"] == 60.0
+    assert row["weightUnit"] == {"unitKey": "kilogram"}
+
+
+def test_strength_weight_unit_aliases_normalize():
+    for alias, expected in [
+        ("lb", "pound"),
+        ("lbs", "pound"),
+        ("pounds", "pound"),
+        ("KG", "kilogram"),
+        ("kilograms", "kilogram"),
+    ]:
+        result = build_strength_json(
+            name="X",
+            exercises=[{"name": "Squat", "sets": 1, "reps": 1, "weight": 100, "weight_unit": alias}],
+        )
+        assert _work_steps(result)[0]["weightUnit"] == {"unitKey": expected}
+
+
+def test_strength_rejects_bad_weight():
+    for bad in (0, -20, "heavy", True):
+        with pytest.raises(ValueError):
+            build_strength_json(
+                name="Bad",
+                exercises=[{"name": "Squat", "sets": 1, "reps": 1, "weight": bad}],
+            )
+
+
+def test_strength_rejects_unknown_weight_unit():
+    with pytest.raises(ValueError):
+        build_strength_json(
+            name="Bad",
+            exercises=[{"name": "Squat", "sets": 1, "reps": 1, "weight": 100, "weight_unit": "stone"}],
+        )
