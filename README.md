@@ -40,6 +40,7 @@ This MCP server implements **110+ tools** covering ~90% of the [python-garmincon
 - ✅ User Profile (3 tools)
 - ✅ High-Level Workout Builders (4 tools) - create and schedule workouts without writing JSON
 - ✅ Courses (3 tools) - list / upload GPX as course / delete course
+- ✅ Calendar Events (5 tools) - create / list / get / delete races and events on the Garmin Connect calendar, plus read the primary event
 - ✅ Activity Analysis (2 tools) - FIT file parsing, Power Duration Curve; requires power meter and/or Di2
 - ✅ Activity File Downloads (2 tools) - download activity files in FIT, GPX, TCX, or CSV format
 
@@ -131,6 +132,43 @@ set. If rep-based sets omit `duration_seconds`, the tool evenly distributes the
 unallocated recorded time among them. If every duration is explicit, leftover
 time becomes a trailing REST set. The preview shows this synthesized timeline
 before any write, and the total recorded exercise-set duration is never changed.
+
+### Calendar events
+
+`python-garminconnect` has no calendar-event support, so these tools call the
+undocumented `calendar-service` endpoints used by the Connect web calendar's
+"Add an Event" dialog:
+
+- `create_calendar_event` - add a race or event to the calendar
+- `get_calendar_events` - list upcoming events
+- `get_calendar_event` - one event by id
+- `get_primary_event` - the goal race that race predictions count down to
+- `delete_calendar_event` - remove an event
+
+Only `name`, `date`, and `event_type` are required. `event_type` is one of
+`running`, `trail_running`, `cycling`, `gravel_cycling`, `mountain_biking`,
+`swimming`, `multi_sport` (triathlon/duathlon), `hiking`, `walking`,
+`fitness_equipment`, `winter_sports`, `other`.
+
+```json
+{
+  "name": "Boston Marathon",
+  "date": "2027-04-19",
+  "event_type": "running",
+  "start_time": "10:00",
+  "timezone": "America/New_York",
+  "distance": 26.2,
+  "distance_unit": "mile",
+  "location": "Boston, MA"
+}
+```
+
+Pass `goal_time_seconds` instead of `distance` for a time-based event (e.g. a
+6-hour ultra), and set `race: true` to mark the entry as a race. `create_calendar_event`
+is idempotent: a second call with the same name and date returns the existing
+event instead of creating a duplicate.
+Setting an event as the *primary* race is a separate Garmin flow and is not
+exposed here.
 
 ### Intentionally Skipped Endpoints
 
